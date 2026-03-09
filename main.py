@@ -1,15 +1,15 @@
 import os
 import re
+import json
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
 from youtube_transcript_api.proxies import WebshareProxyConfig
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 公開Invidiousインスタンス（複数用意して順に試す）
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://yewtu.be",
@@ -17,68 +17,122 @@ INVIDIOUS_INSTANCES = [
     "https://iv.datura.network",
     "https://invidious.lunar.icu",
     "https://invidious.nerdvpn.de",
-    "https://yt.artemislena.eu",
-    "https://invidious.slipfox.xyz",
 ]
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+}
 
-def build_api():
-    proxy_user = os.environ.get("PROXY_USERNAME")
-    proxy_pass = os.environ.get("PROXY_PASSWORD")
-    if proxy_user and proxy_pass:
-        return YouTubeTranscriptApi(proxies=WebshareProxyConfig(
-            proxy_username=proxy_user,
-            proxy_password=proxy_pass,
-        ))
-    return YouTubeTranscriptApi()
 
-
-def fetch_via_youtube_api(video_id: str):
-    """youtube_transcript_api ライブラリで直接取得"""
+# ── 方法1: youtube_transcript_api ライブラリ ────────────────────────
+def fetch_via_library(video_id: str):
     try:
-        api = build_api()
+        proxy_user = os.environ.get("PROXY_USERNAME")
+        proxy_pass = os.environ.get("PROXY_PASSWORD")
+        api = (
+            YouTubeTranscriptApi(proxies=WebshareProxyConfig(
+                proxy_username=proxy_user, proxy_password=proxy_pass))
+            if proxy_user and proxy_pass
+            else YouTubeTranscriptApi()
+        )
         tlist = api.list(video_id)
         transcript = None
-        try:
-            transcript = tlist.find_manually_created_transcript(["ja"])
-        except NoTranscriptFound:
-            pass
-        if transcript is None:
+        for finder, langs in [
+            (tlist.find_manually_created_transcript, ["ja"]),
+            (tlist.find_generated_transcript, ["ja", "en"]),
+        ]:
             try:
-                transcript = tlist.find_generated_transcript(["ja", "en"])
+                transcript = finder(langs)
+                break
             except NoTranscriptFound:
                 pass
         if transcript is None:
             return None
         segs = transcript.fetch()
-        segments = [s.text.replace("\n", " ") for s in segs if s.text.strip()]
-        return {"segments": segments} if segments else None
+        texts = [s.text.replace("\n", " ") for s in segs if s.text.strip()]
+        return {"segments": texts} if texts else None
     except Exception:
         return None
 
 
+# ── 方法2: ウォッチページHTMLからキャプションURL抽出 ─────────────────
+def fetch_via_watch_page(video_id: str):
+    try:
+        res = requests.get(
+            f"https://www.youtube.com/watch?v={video_id}&hl=ja",
+            headers=HEADERS, timeout=15,
+        )
+        html = res.text
+
+        # ytInitialPlayerResponse を JSON として取り出す
+        m = re.search(r"ytInitialPlayerResponse\s*=\s*", html)
+        if not m:
+            return None
+        start = m.end()
+        depth, end = 0, start
+        for i, c in enumerate(html[start:]):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = start + i + 1
+                    break
+        pr = json.loads(html[start:end])
+
+        tracks = (pr.get("captions", {})
+                    .get("playerCaptionsTracklistRenderer", {})
+                    .get("captionTracks", []))
+        if not tracks:
+            return None
+
+        # 日本語優先、次に英語
+        target = None
+        for lang in ["ja", "en"]:
+            for t in tracks:
+                if t.get("languageCode", "").startswith(lang):
+                    target = t
+                    break
+            if target:
+                break
+        if not target:
+            target = tracks[0]
+
+        base_url = target.get("baseUrl", "")
+        if not base_url:
+            return None
+
+        xml_res = requests.get(base_url, headers=HEADERS, timeout=10)
+        segs = _parse_subtitle(xml_res.text)
+        return {"segments": segs} if segs else None
+    except Exception:
+        return None
+
+
+# ── 方法3: Invidious 公開インスタンス ────────────────────────────────
 def fetch_via_invidious(video_id: str):
-    """Invidious公開インスタンス経由で字幕取得"""
     for instance in INVIDIOUS_INSTANCES:
         try:
-            res = requests.get(
+            r = requests.get(
                 f"{instance}/api/v1/captions/{video_id}",
-                timeout=10,
-                headers={"User-Agent": "Mozilla/5.0"}
+                timeout=10, headers={"User-Agent": "Mozilla/5.0"},
             )
-            if res.status_code != 200:
+            if r.status_code != 200:
                 continue
-
-            data = res.json()
-            captions = data.get("captions", [])
+            captions = r.json().get("captions", [])
             if not captions:
                 continue
 
-            # 日本語優先、なければ英語、それ以外は先頭
             target = None
-            for lang_prefix in ["ja", "en"]:
+            for lang in ["ja", "en"]:
                 for cap in captions:
-                    if cap.get("languageCode", "").startswith(lang_prefix):
+                    if cap.get("languageCode", "").startswith(lang):
                         target = cap
                         break
                 if target:
@@ -86,30 +140,23 @@ def fetch_via_invidious(video_id: str):
             if not target:
                 target = captions[0]
 
-            label = target.get("label", "")
-            vtt_url = (
-                f"{instance}/api/v1/captions/{video_id}"
-                f"?label={requests.utils.quote(label)}"
+            label = requests.utils.quote(target.get("label", ""))
+            vtt = requests.get(
+                f"{instance}/api/v1/captions/{video_id}?label={label}",
+                timeout=10, headers={"User-Agent": "Mozilla/5.0"},
             )
-            vtt_res = requests.get(
-                vtt_url, timeout=10,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if vtt_res.status_code != 200:
+            if vtt.status_code != 200:
                 continue
-
-            segments = _parse_subtitle(vtt_res.text)
-            if segments:
-                return {"segments": segments}
+            segs = _parse_subtitle(vtt.text)
+            if segs:
+                return {"segments": segs}
         except Exception:
             continue
-
     return None
 
 
+# ── 字幕テキスト解析 ─────────────────────────────────────────────────
 def _parse_subtitle(content: str) -> list:
-    """WebVTT または XML 字幕からテキストを抽出"""
-    # WebVTT
     if "WEBVTT" in content:
         texts = []
         for line in content.split("\n"):
@@ -121,11 +168,9 @@ def _parse_subtitle(content: str) -> list:
                 texts.append(text)
         return texts
 
-    # XML
     if "<text" in content:
-        matches = re.findall(r"<text[^>]*>([^<]*)</text>", content)
         texts = []
-        for m in matches:
+        for m in re.findall(r"<text[^>]*>([^<]*)</text>", content):
             text = (m.replace("&amp;", "&").replace("&lt;", "<")
                      .replace("&gt;", ">").replace("&#39;", "'")
                      .replace("&quot;", '"').strip())
@@ -136,6 +181,7 @@ def _parse_subtitle(content: str) -> list:
     return []
 
 
+# ── エンドポイント ────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -143,14 +189,8 @@ def root():
 
 @app.get("/transcript/{video_id}")
 def get_transcript(video_id: str):
-    # 1. youtube_transcript_api ライブラリ（直接）
-    result = fetch_via_youtube_api(video_id)
-    if result:
-        return result
-
-    # 2. Invidious 経由
-    result = fetch_via_invidious(video_id)
-    if result:
-        return result
-
+    for fn in [fetch_via_library, fetch_via_watch_page, fetch_via_invidious]:
+        result = fn(video_id)
+        if result:
+            return result
     return {"segments": [], "error": "all_methods_failed"}
